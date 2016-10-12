@@ -9,8 +9,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -18,7 +20,7 @@ import (
 const (
 	apiURL       = "https://api.github.com"
 	acceptHeader = "application/vnd.github.v3+json"
-	authToken    = "token ba0c7dd43b263ef005f41c3fda7e6fc7e76394bd"
+	authToken    = "token d15a404cdb7d819da98d9c41d2053ca89cd0057f"
 )
 
 var action string
@@ -91,6 +93,14 @@ func init() {
 func main() {
 	flag.Parse()
 
+	if editor {
+		err := edit(id, &body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error editing issue body: %v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	switch strings.ToLower(action) {
 	case "create":
 		issue, err := create(owner, repos, title, body)
@@ -121,9 +131,62 @@ func main() {
 	}
 }
 
+func edit(id int, body *string) error {
+	ed := os.Getenv("EDITOR")
+	if len(ed) == 0 {
+		return fmt.Errorf("$EDITOR environment variable not exported")
+	}
+	if id > 0 {
+		issue, err := read(owner, repos, id)
+		if err != nil {
+			return fmt.Errorf("Failed to read issue %d: %v\n", id, err)
+		}
+		*body = issue.Body
+	}
+	tmpfile, err := write([]byte(*body))
+	if err != nil {
+		return fmt.Errorf("Failed to write temp file: %v\n", err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if err := open(tmpfile, ed); err != nil {
+		return fmt.Errorf("Failed to open editor: %v\n", err)
+	}
+	bytes, err := ioutil.ReadFile(tmpfile.Name())
+	if err != nil {
+		return fmt.Errorf("Failed to read temp file: %v\n", err)
+	}
+	*body = string(bytes)
+	return nil
+}
+
+func open(f *os.File, ed string) error {
+	fmt.Println(ed, f.Name())
+	cmd := exec.Command(ed, f.Name())
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func write(b []byte) (*os.File, error) {
+	tmpfile, err := ioutil.TempFile("", "scratch")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tmpfile.Write(b); err != nil {
+		return nil, err
+	}
+	if err := tmpfile.Close(); err != nil {
+		return nil, err
+	}
+	return tmpfile, nil
+}
+
 type RequestIssue struct {
-	Title string `json:"title"`
-	Body string `json:"body"`
+	Title string `json:"title,omitempty"`
+	Body  string `json:"body,omitempty"`
 }
 
 func create(owner, repos, title, body string) (*Issue, error) {
@@ -137,26 +200,33 @@ func create(owner, repos, title, body string) (*Issue, error) {
 		return nil, fmt.Errorf("Title is required to create issues")
 	}
 
+	post := RequestIssue{}
+	if len(title) > 0 {
+		post.Title = title
+	}
+	if len(body) > 0 {
+		post.Body = body
+	}
+
 	// POST /repos/:owner/:repo/issues
-	params := fmt.Sprintf("/repos/%s/%s/issues", owner, repos)
-	url := fmt.Sprintf("%s%s", apiURL, params)
-	data, err := json.Marshal(RequestIssue{
-		Title: title,
-		Body: body,
-	})
+	resource := fmt.Sprintf("/repos/%s/%s/issues", owner, repos)
+	url := fmt.Sprintf("%s%s", apiURL, resource)
+	data, err := json.Marshal(post)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to marshal to json: %v", err)
 	}
-	return request("POST", url, bytes.NewBuffer(data), http.StatusCreated)
+	return request(http.MethodPost, url, bytes.NewBuffer(data), http.StatusCreated, true)
 }
 
-func request(method, url string, reader io.Reader, status int) (*Issue, error) {
+func request(method, url string, reader io.Reader, status int, auth bool) (*Issue, error) {
 	req, err := http.NewRequest(method, url, reader)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", acceptHeader)
-	req.Header.Set("Authorization", authToken)
+	if auth {
+		req.Header.Set("Authorization", authToken)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if resp.StatusCode != status {
 		resp.Body.Close()
@@ -172,7 +242,32 @@ func request(method, url string, reader io.Reader, status int) (*Issue, error) {
 }
 
 func update(owner, repos string, id int, title, body string) (*Issue, error) {
-	return nil, fmt.Errorf("Not implemented update")
+	if len(owner) == 0 {
+		return nil, fmt.Errorf("Owner required to update issues")
+	}
+	if len(repos) == 0 {
+		return nil, fmt.Errorf("Repository required to update issues")
+	}
+	if id < 1 {
+		return nil, fmt.Errorf("Valid ID is required to update issues")
+	}
+
+	patch := RequestIssue{}
+	if len(title) > 0 {
+		patch.Title = title
+	}
+	if len(body) > 0 {
+		patch.Body = body
+	}
+	
+	// PATCH /repos/:owner/:repo/issues/:number
+	resource := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repos, id)
+	url := fmt.Sprintf("%s%s", apiURL, resource)
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to marshal to json: %v", err)
+	}
+	return request(http.MethodPatch, url, bytes.NewBuffer(data), http.StatusOK, true)
 }
 
 type Issue struct {
@@ -199,10 +294,11 @@ func read(owner, repos string, id int) (*Issue, error) {
 	if id < 1 {
 		return nil, fmt.Errorf("Valid ID is required to read issues")
 	}
-
-	params := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repos, id)
-	url := fmt.Sprintf("%s%s", apiURL, params)
-	return request("GET", url, nil, http.StatusOK)
+	
+	// GET /repos/:owner/:repo/issues/:number
+	resource := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repos, id)
+	url := fmt.Sprintf("%s%s", apiURL, resource)
+	return request(http.MethodGet, url, nil, http.StatusOK, false)
 }
 
 func report(i *Issue) {
